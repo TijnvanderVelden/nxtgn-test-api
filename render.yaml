@@ -1,0 +1,14 @@
+# Render Blueprint — beschrijft hoe de test API server in de cloud draait.
+# Bij het koppelen van de repo leest Render dit bestand automatisch.
+services:
+  - type: web
+    name: nxtgn-test-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python test_api_server.py
+    healthCheckPath: /health
+    envVars:
+      # De Bearer-token. 'sync: false' = niet in code, je vult hem in op Render zelf.
+      - key: TEST_API_INTERNAL_KEY
+        sync: false

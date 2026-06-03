@@ -1,0 +1,18 @@
+# Geheimen — nooit naar GitHub
+.env
+*.env
+
+# Zware/lokale binary
+cloudflared.exe
+
+# Logs en process-bestanden van de lokale runs
+*.log
+*.out
+*.pid
+
+# Interne notities
+memory/
+
+# Python rommel
+__pycache__/
+*.pyc
