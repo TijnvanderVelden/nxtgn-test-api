@@ -120,6 +120,52 @@ def partner_request(method, path, body=None):
     return resp.status_code, parsed
 
 
+# Short cache of the full (paginated) events list to avoid refetching every call.
+_events_cache = {'events': None, 'expires_at': 0.0}
+
+
+def fetch_all_events():
+    """Fetch ALL events across every page (the Partner API paginates).
+
+    Uses the X-TF-PAGINATION-SKIP header and the x-tf-pagination-total response
+    header to walk through every page, so search/listing covers all events.
+    """
+    now = time.time()
+    if _events_cache['events'] is not None and now < _events_cache['expires_at']:
+        return _events_cache['events']
+
+    token = get_partner_token()
+    url = f'{PARTNER_BASE}/events'
+    all_events = []
+    skip = 0
+    total = None
+    for _ in range(200):  # safety cap (max 200 pages)
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json',
+            'X-TF-PAGINATION-SKIP': str(skip),
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        page = resp.json()
+        if not isinstance(page, list) or not page:
+            break
+        all_events.extend(page)
+        if total is None:
+            try:
+                total = int(resp.headers.get('x-tf-pagination-total') or 0)
+            except (TypeError, ValueError):
+                total = 0
+        skip += len(page)
+        if total and skip >= total:
+            break
+
+    _events_cache['events'] = all_events
+    _events_cache['expires_at'] = now + 60  # cache for 60s
+    print(f'  [LIVE] fetched {len(all_events)} events (total header={total})', flush=True)
+    return all_events
+
+
 def trim_event(ev):
     """Reduce a raw Partner API event to the fields a dashboard needs."""
     if not isinstance(ev, dict):
@@ -265,17 +311,12 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         resource_path = parsed.path
 
-        # Special handling for the events list (search + trim).
+        # Special handling for the events list (all pages + search + trim).
         if resource_path == '/events':
             try:
-                status, data = partner_request('GET', '/events')
+                data = fetch_all_events()
             except Exception as e:
                 self._send_error(502, f'Partner API call failed: {e}')
-                return
-            if not isinstance(data, list):
-                self._send_json(status, {'status': status, 'data': data,
-                                         'source': 'partner_api_live',
-                                         'timestamp': datetime.now().isoformat()})
                 return
 
             trimmed = [trim_event(e) for e in data]
