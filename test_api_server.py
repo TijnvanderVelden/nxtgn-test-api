@@ -1,26 +1,42 @@
 """
 Test API Server voor HALO MCP integratie proof-of-concept.
 
-Deze server simuleert NxtGn Ticketing API endpoints met mock data om te
-testen of een HALO agent via tools succesvol API calls kan maken.
+Twee modi:
 
-Endpoints:
-  GET  /health                    - Health check (no auth)
-  GET  /events                    - List all events
-  GET  /events/{id}               - Get specific event details
-  GET  /events/{id}/stats         - Get scan statistics for event
-  POST /entrance-plans            - Create entrance plan
+1. MOCK (geen Partner-credentials gezet): geeft verzonnen events/statistieken
+   terug. Handig om de HALO-keten te testen zonder echte API.
 
-Authentication:
-  Bearer token via Authorization header
-  Token moet matchen met TEST_API_INTERNAL_KEY in .env
+2. LIVE (PARTNER_API_* env vars gezet): werkt als een geauthenticeerde proxy
+   naar de NxtGn General Admission Partner API. De server logt zelf in
+   (token caching/refresh) en hangt automatisch de Bearer-token + juiste
+   headers aan elk pad dat de HALO-tool meegeeft. Daardoor zijn ALLE Partner
+   API-endpoints bruikbaar zonder ze stuk voor stuk in te bouwen.
+
+   Voorbeeldpaden (de agent kettingt de variabelen zelf):
+     GET  /events
+     GET  /events/{event_uuid}
+     GET  /events/{event_uuid}/products
+     GET  /events/{event_uuid}/orders?status=COMPLETED
+     GET  /events/{event_uuid}/orders/{order_id}
+     POST /events/{event_uuid}/reservations/generate   (body: ticket_types + customer_data)
+     POST /events/{event_uuid}/reservations/create
+     POST /events/{event_uuid}/reservations/{order_id}/complete
+
+Authentication (HALO -> deze server):
+  Bearer token via Authorization header, moet matchen met TEST_API_INTERNAL_KEY.
 
 Run:
   python test_api_server.py
 
-Config (.env):
-  TEST_API_PORT=8082
-  TEST_API_INTERNAL_KEY=test-key-12345
+Config (.env / env vars):
+  PORT / TEST_API_PORT          - poort (default 8082; cloud hosts zetten PORT)
+  TEST_API_INTERNAL_KEY         - Bearer-token tussen HALO en deze server
+  PARTNER_API_BASE_URL          - bv. https://api.ticketing.cm.com/partnerapi/v1.0
+  PARTNER_API_SIGNIN_URL        - bv. <base>/auth/signin
+  PARTNER_API_EMAIL             - Partner API signin e-mail
+  PARTNER_API_PASSWORD          - Partner API signin wachtwoord
+  PARTNER_API_TTL               - token-cache in seconden (default 3000)
+  PARTNER_API_MAX_EVENTS        - max events in /events lijst (default 50)
 """
 
 import json
@@ -38,20 +54,16 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Cloud hosts (Render, Railway, etc.) inject the port via the PORT env var.
-# Fall back to TEST_API_PORT for local runs, then 8082 as a last resort.
 PORT = int(os.getenv('PORT') or os.getenv('TEST_API_PORT') or '8082')
 INTERNAL_KEY = os.getenv('TEST_API_INTERNAL_KEY', 'test-key-12345')
 
 # --- NxtGn Partner API (live mode) -----------------------------------------
-# When these env vars are set, the server fetches real data from the NxtGn
-# Partner API instead of returning mock data. Otherwise it falls back to mock.
 PARTNER_BASE = (os.getenv('PARTNER_API_BASE_URL') or '').rstrip('/')
 PARTNER_SIGNIN = os.getenv('PARTNER_API_SIGNIN_URL') or (f'{PARTNER_BASE}/auth/signin' if PARTNER_BASE else '')
 PARTNER_EMAIL = os.getenv('PARTNER_API_EMAIL')
 PARTNER_PASSWORD = os.getenv('PARTNER_API_PASSWORD')
-PARTNER_TTL = int(os.getenv('PARTNER_API_TTL', '3000'))  # token cache seconds (~50 min)
-PARTNER_MAX_EVENTS = int(os.getenv('PARTNER_API_MAX_EVENTS', '25'))  # cap list size for readability
+PARTNER_TTL = int(os.getenv('PARTNER_API_TTL', '3000'))          # token cache seconds (~50 min)
+PARTNER_MAX_EVENTS = int(os.getenv('PARTNER_API_MAX_EVENTS', '50'))
 LIVE_MODE = bool(PARTNER_BASE and PARTNER_SIGNIN and PARTNER_EMAIL and PARTNER_PASSWORD)
 
 # In-memory token cache: signin once, reuse until it (nearly) expires.
@@ -76,14 +88,36 @@ def get_partner_token():
     return token
 
 
-def partner_get(path):
-    """GET a resource from the Partner API using the cached bearer token."""
+def partner_request(method, path, body=None):
+    """Forward a request to the Partner API with auth attached.
+
+    `path` is the resource path (with optional ?query) exactly as the caller
+    requested it. Returns (http_status, parsed_body_or_text).
+    """
     token = get_partner_token()
     url = f'{PARTNER_BASE}/{path.lstrip("/")}'
-    resp = requests.get(url, headers={'Authorization': f'Bearer {token}',
-                                      'Accept': 'application/json'}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    }
+    # Reservations require a distribution method header.
+    if '/reservations' in path:
+        headers['X-TF-DISTRIBUTION-METHOD'] = 'EMAIL'
+
+    if method == 'POST':
+        json_body = body
+        if isinstance(body, str):
+            json_body = json.loads(body) if body.strip() else None
+        resp = requests.post(url, headers=headers, json=json_body, timeout=30)
+    else:
+        resp = requests.get(url, headers=headers, timeout=30)
+
+    try:
+        parsed = resp.json()
+    except Exception:
+        parsed = resp.text
+    return resp.status_code, parsed
 
 
 def trim_event(ev):
@@ -92,16 +126,20 @@ def trim_event(ev):
         return ev
     venue = ev.get('venue')
     venue_name = venue.get('name') if isinstance(venue, dict) else venue
+    name = ev.get('name')
+    if isinstance(name, dict):
+        name = name.get('en') or name.get('nl') or next(iter(name.values()), None)
     return {
-        'id': ev.get('uuid'),
-        'name': ev.get('name'),
+        'id': ev.get('uuid') or ev.get('id'),
+        'name': name,
         'start_at': ev.get('start_at'),
         'end_at': ev.get('end_at'),
         'venue': venue_name,
         'is_visible': ev.get('is_visible'),
     }
 
-# Mock data storage (in-memory)
+
+# --- Mock data (fallback when no Partner credentials) ----------------------
 MOCK_EVENTS = {
     "1": {
         "id": "1",
@@ -148,7 +186,7 @@ MOCK_STATISTICS = {
     }
 }
 
-# In-memory storage for created entrance plans
+# In-memory storage for created entrance plans (mock mode only)
 ENTRANCE_PLANS = []
 
 
@@ -177,17 +215,15 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self):
-        """Read and parse JSON request body."""
+        """Read and parse JSON request body (tolerant of double-encoded JSON)."""
         length = int(self.headers.get('Content-Length', '0'))
         if length == 0:
             return {}
         try:
             raw = self.rfile.read(length)
             decoded = raw.decode('utf-8')
-            print(f'  [DEBUG] Content-Type={self.headers.get("Content-Type")!r} '
-                  f'raw body={decoded!r}', flush=True)
             parsed = json.loads(decoded)
-            # Tolerate double-encoded JSON (a JSON string containing JSON)
+            # HALO http_activity may double-encode a string body.
             if isinstance(parsed, str):
                 parsed = json.loads(parsed)
             return parsed
@@ -195,7 +231,7 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             raise ValueError(f'Invalid JSON payload: {e}')
 
     def _auth_check(self):
-        """Check Bearer token authentication."""
+        """Check Bearer token authentication (HALO -> this server)."""
         auth = self.headers.get('Authorization', '')
         if not auth.startswith('Bearer '):
             return False
@@ -218,6 +254,54 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.end_headers()
 
+    # --- live-mode proxy helpers -------------------------------------------
+    def _live_get(self):
+        """Proxy a GET to the Partner API. Trims the /events list for readability."""
+        full_path = self.path                      # path + optional ?query
+        resource_path = urlparse(self.path).path   # path without query
+        try:
+            status, data = partner_request('GET', full_path)
+        except Exception as e:
+            self._send_error(502, f'Partner API call failed: {e}')
+            return
+
+        if resource_path == '/events' and isinstance(data, list):
+            events = [trim_event(e) for e in data[:PARTNER_MAX_EVENTS]]
+            self._send_json(200, {
+                'events': events,
+                'count': len(events),
+                'total_available': len(data),
+                'source': 'partner_api_live',
+                'timestamp': datetime.now().isoformat()
+            })
+            return
+
+        self._send_json(status, {
+            'status': status,
+            'data': data,
+            'source': 'partner_api_live',
+            'timestamp': datetime.now().isoformat()
+        })
+
+    def _live_post(self):
+        """Proxy a POST to the Partner API (e.g. reservations)."""
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            self._send_error(400, str(e))
+            return
+        try:
+            status, data = partner_request('POST', self.path, body)
+        except Exception as e:
+            self._send_error(502, f'Partner API call failed: {e}')
+            return
+        self._send_json(status, {
+            'status': status,
+            'data': data,
+            'source': 'partner_api_live',
+            'timestamp': datetime.now().isoformat()
+        })
+
     def do_GET(self):
         """Handle GET requests."""
         parsed = urlparse(self.path)
@@ -228,7 +312,8 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 'status': 'healthy',
                 'server': 'Test API Server',
-                'version': '1.0.0',
+                'version': '2.0.0',
+                'mode': 'live' if LIVE_MODE else 'mock',
                 'timestamp': datetime.now().isoformat()
             })
             return
@@ -238,21 +323,14 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             self._send_error(401, 'Unauthorized: Invalid or missing Bearer token')
             return
 
+        # LIVE MODE: act as an authenticated proxy to the Partner API.
+        if LIVE_MODE:
+            self._live_get()
+            return
+
         try:
-            # GET /events - List all events
+            # GET /events - List all events (mock)
             if path == '/events':
-                if LIVE_MODE:
-                    raw = partner_get('/events')
-                    items = raw if isinstance(raw, list) else raw.get('events', [])
-                    events_list = [trim_event(e) for e in items[:PARTNER_MAX_EVENTS]]
-                    self._send_json(200, {
-                        'events': events_list,
-                        'count': len(events_list),
-                        'total_available': len(items),
-                        'source': 'partner_api_live',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    return
                 events_list = list(MOCK_EVENTS.values())
                 self._send_json(200, {
                     'events': events_list,
@@ -262,23 +340,9 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # GET /events/{id} - Get specific event
+            # GET /events/{id} - Get specific event (mock)
             if path.startswith('/events/') and not path.endswith('/stats'):
                 event_id = path.split('/')[-1]
-                if LIVE_MODE:
-                    raw = partner_get('/events')
-                    items = raw if isinstance(raw, list) else raw.get('events', [])
-                    match = next((e for e in items if isinstance(e, dict)
-                                  and e.get('uuid') == event_id), None)
-                    if match:
-                        self._send_json(200, {
-                            'event': match,
-                            'source': 'partner_api_live',
-                            'timestamp': datetime.now().isoformat()
-                        })
-                    else:
-                        self._send_error(404, f'Event not found: {event_id}')
-                    return
                 event = MOCK_EVENTS.get(event_id)
                 if event:
                     self._send_json(200, {
@@ -289,20 +353,12 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                     self._send_error(404, f'Event not found: {event_id}')
                 return
 
-            # GET /events/{id}/stats - Get scan statistics
+            # GET /events/{id}/stats - Get scan statistics (mock)
             if path.startswith('/events/') and path.endswith('/stats'):
                 event_id = path.split('/')[-2]
-                if LIVE_MODE:
-                    self._send_json(200, {
-                        'message': 'Scan statistics are not available via the NxtGn Partner API in this POC (only event data is live).',
-                        'source': 'partner_api_live',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    return
                 if event_id not in MOCK_EVENTS:
                     self._send_error(404, f'Event not found: {event_id}')
                     return
-
                 stats = MOCK_STATISTICS.get(event_id, {})
                 self._send_json(200, {
                     'statistics': stats,
@@ -310,7 +366,7 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # GET /entrance-plans - List created entrance plans
+            # GET /entrance-plans - List created entrance plans (mock)
             if path == '/entrance-plans':
                 self._send_json(200, {
                     'entrance_plans': ENTRANCE_PLANS,
@@ -319,7 +375,6 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Unknown endpoint
             self._send_error(404, f'Endpoint not found: {path}')
 
         except Exception as e:
@@ -336,25 +391,20 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             self._send_error(401, 'Unauthorized: Invalid or missing Bearer token')
             return
 
-        try:
-            # POST /entrance-plans - Create entrance plan
-            if path == '/entrance-plans':
-                if LIVE_MODE:
-                    self._send_json(200, {
-                        'success': False,
-                        'message': 'Creating entrance plans is not available via the NxtGn Partner API in this POC (event data is read-only/live).',
-                        'source': 'partner_api_live',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    return
+        # LIVE MODE: proxy the POST straight to the Partner API.
+        if LIVE_MODE:
+            self._live_post()
+            return
 
+        try:
+            # POST /entrance-plans - Create entrance plan (mock)
+            if path == '/entrance-plans':
                 body = self._read_json()
 
                 if not isinstance(body, dict):
                     self._send_error(400, f'Body must be a JSON object, got {type(body).__name__}')
                     return
 
-                # Validate required fields
                 event_id = body.get('event_id')
                 plan_name = body.get('name')
 
@@ -362,17 +412,14 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                     self._send_error(400, 'Missing required fields: event_id, name')
                     return
 
-                # Validate event exists
                 if event_id not in MOCK_EVENTS:
                     self._send_error(404, f'Event not found: {event_id}')
                     return
 
-                # Generate credentials
                 username = f'scan_{event_id}_{generate_random_string(4)}'
                 password = generate_random_string(12)
                 plan_id = f'ep_{len(ENTRANCE_PLANS) + 1}'
 
-                # Create entrance plan
                 entrance_plan = {
                     'id': plan_id,
                     'event_id': event_id,
@@ -384,8 +431,6 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                     'status': 'active',
                     'created_at': datetime.now().isoformat()
                 }
-
-                # Store in memory
                 ENTRANCE_PLANS.append(entrance_plan)
 
                 self._send_json(201, {
@@ -396,7 +441,6 @@ class TestAPIHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Unknown endpoint
             self._send_error(404, f'Endpoint not found: {path}')
 
         except ValueError as e:
@@ -411,26 +455,18 @@ def run_server():
     server_address = ('', PORT)
     httpd = HTTPServer(server_address, TestAPIHandler)
 
-    print('\n' + '='*60)
+    print('\n' + '=' * 60)
     print('>>> Test API Server gestart')
-    print('='*60)
+    print('=' * 60)
     print(f'Port: {PORT}')
     print(f'Authentication: Bearer {INTERNAL_KEY}')
     if LIVE_MODE:
-        print(f'Data mode: LIVE  -> NxtGn Partner API ({PARTNER_BASE})')
+        print(f'Data mode: LIVE  -> proxy to {PARTNER_BASE}')
+        print('  Any path is forwarded to the Partner API with auth attached.')
     else:
         print('Data mode: MOCK  (set PARTNER_API_* env vars for live data)')
-    print(f'\nEndpoints:')
-    print(f'  GET  http://localhost:{PORT}/health')
-    print(f'  GET  http://localhost:{PORT}/events')
-    print(f'  GET  http://localhost:{PORT}/events/{{id}}')
-    print(f'  GET  http://localhost:{PORT}/events/{{id}}/stats')
-    print(f'  POST http://localhost:{PORT}/entrance-plans')
-    print(f'\nTest met curl:')
-    print(f'  curl http://localhost:{PORT}/health')
-    print(f'  curl -H "Authorization: Bearer {INTERNAL_KEY}" http://localhost:{PORT}/events')
     print('\nDruk Ctrl+C om te stoppen')
-    print('='*60 + '\n')
+    print('=' * 60 + '\n')
 
     try:
         httpd.serve_forever()
