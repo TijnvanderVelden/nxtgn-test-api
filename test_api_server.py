@@ -46,7 +46,7 @@ import string
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from dotenv import load_dotenv
@@ -256,26 +256,53 @@ class TestAPIHandler(BaseHTTPRequestHandler):
 
     # --- live-mode proxy helpers -------------------------------------------
     def _live_get(self):
-        """Proxy a GET to the Partner API. Trims the /events list for readability."""
-        full_path = self.path                      # path + optional ?query
-        resource_path = urlparse(self.path).path   # path without query
-        try:
-            status, data = partner_request('GET', full_path)
-        except Exception as e:
-            self._send_error(502, f'Partner API call failed: {e}')
-            return
+        """Proxy a GET to the Partner API.
 
-        if resource_path == '/events' and isinstance(data, list):
-            events = [trim_event(e) for e in data[:PARTNER_MAX_EVENTS]]
+        For the /events list we fetch the full list and (optionally) filter it
+        server-side by ?search=<term> so the agent can reliably resolve the
+        event the user named to its event_uuid — without ever guessing.
+        """
+        parsed = urlparse(self.path)
+        resource_path = parsed.path
+
+        # Special handling for the events list (search + trim).
+        if resource_path == '/events':
+            try:
+                status, data = partner_request('GET', '/events')
+            except Exception as e:
+                self._send_error(502, f'Partner API call failed: {e}')
+                return
+            if not isinstance(data, list):
+                self._send_json(status, {'status': status, 'data': data,
+                                         'source': 'partner_api_live',
+                                         'timestamp': datetime.now().isoformat()})
+                return
+
+            trimmed = [trim_event(e) for e in data]
+            search = (parse_qs(parsed.query).get('search', [''])[0] or '').strip().lower()
+            if search:
+                matches = [e for e in trimmed if search in (str(e.get('name') or '')).lower()]
+            else:
+                matches = trimmed[:PARTNER_MAX_EVENTS]
+
             self._send_json(200, {
-                'events': events,
-                'count': len(events),
+                'events': matches,
+                'count': len(matches),
                 'total_available': len(data),
+                'search': search or None,
+                'note': ('Pass ?search=<event name> to find a specific event and its id.'
+                         if not search else None),
                 'source': 'partner_api_live',
                 'timestamp': datetime.now().isoformat()
             })
             return
 
+        # Everything else: forward the full path (incl. query) untouched.
+        try:
+            status, data = partner_request('GET', self.path)
+        except Exception as e:
+            self._send_error(502, f'Partner API call failed: {e}')
+            return
         self._send_json(status, {
             'status': status,
             'data': data,
