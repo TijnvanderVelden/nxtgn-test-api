@@ -27,10 +27,12 @@ import json
 import os
 import random
 import string
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
+import requests
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -40,6 +42,64 @@ load_dotenv()
 # Fall back to TEST_API_PORT for local runs, then 8082 as a last resort.
 PORT = int(os.getenv('PORT') or os.getenv('TEST_API_PORT') or '8082')
 INTERNAL_KEY = os.getenv('TEST_API_INTERNAL_KEY', 'test-key-12345')
+
+# --- NxtGn Partner API (live mode) -----------------------------------------
+# When these env vars are set, the server fetches real data from the NxtGn
+# Partner API instead of returning mock data. Otherwise it falls back to mock.
+PARTNER_BASE = (os.getenv('PARTNER_API_BASE_URL') or '').rstrip('/')
+PARTNER_SIGNIN = os.getenv('PARTNER_API_SIGNIN_URL') or (f'{PARTNER_BASE}/auth/signin' if PARTNER_BASE else '')
+PARTNER_EMAIL = os.getenv('PARTNER_API_EMAIL')
+PARTNER_PASSWORD = os.getenv('PARTNER_API_PASSWORD')
+PARTNER_TTL = int(os.getenv('PARTNER_API_TTL', '3000'))  # token cache seconds (~50 min)
+PARTNER_MAX_EVENTS = int(os.getenv('PARTNER_API_MAX_EVENTS', '25'))  # cap list size for readability
+LIVE_MODE = bool(PARTNER_BASE and PARTNER_SIGNIN and PARTNER_EMAIL and PARTNER_PASSWORD)
+
+# In-memory token cache: signin once, reuse until it (nearly) expires.
+_token_cache = {'token': None, 'expires_at': 0.0}
+
+
+def get_partner_token():
+    """Return a cached Partner API bearer token, signing in again when expired."""
+    now = time.time()
+    if _token_cache['token'] and now < _token_cache['expires_at']:
+        return _token_cache['token']
+    resp = requests.post(PARTNER_SIGNIN,
+                         json={'email': PARTNER_EMAIL, 'password': PARTNER_PASSWORD},
+                         headers={'Accept': 'application/json'}, timeout=15)
+    resp.raise_for_status()
+    token = resp.json().get('access_token')
+    if not token:
+        raise RuntimeError('No access_token in signin response')
+    _token_cache['token'] = token
+    _token_cache['expires_at'] = now + PARTNER_TTL
+    print('  [LIVE] Partner API token refreshed', flush=True)
+    return token
+
+
+def partner_get(path):
+    """GET a resource from the Partner API using the cached bearer token."""
+    token = get_partner_token()
+    url = f'{PARTNER_BASE}/{path.lstrip("/")}'
+    resp = requests.get(url, headers={'Authorization': f'Bearer {token}',
+                                      'Accept': 'application/json'}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def trim_event(ev):
+    """Reduce a raw Partner API event to the fields a dashboard needs."""
+    if not isinstance(ev, dict):
+        return ev
+    venue = ev.get('venue')
+    venue_name = venue.get('name') if isinstance(venue, dict) else venue
+    return {
+        'id': ev.get('uuid'),
+        'name': ev.get('name'),
+        'start_at': ev.get('start_at'),
+        'end_at': ev.get('end_at'),
+        'venue': venue_name,
+        'is_visible': ev.get('is_visible'),
+    }
 
 # Mock data storage (in-memory)
 MOCK_EVENTS = {
@@ -181,10 +241,23 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         try:
             # GET /events - List all events
             if path == '/events':
+                if LIVE_MODE:
+                    raw = partner_get('/events')
+                    items = raw if isinstance(raw, list) else raw.get('events', [])
+                    events_list = [trim_event(e) for e in items[:PARTNER_MAX_EVENTS]]
+                    self._send_json(200, {
+                        'events': events_list,
+                        'count': len(events_list),
+                        'total_available': len(items),
+                        'source': 'partner_api_live',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    return
                 events_list = list(MOCK_EVENTS.values())
                 self._send_json(200, {
                     'events': events_list,
                     'count': len(events_list),
+                    'source': 'mock',
                     'timestamp': datetime.now().isoformat()
                 })
                 return
@@ -192,6 +265,20 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             # GET /events/{id} - Get specific event
             if path.startswith('/events/') and not path.endswith('/stats'):
                 event_id = path.split('/')[-1]
+                if LIVE_MODE:
+                    raw = partner_get('/events')
+                    items = raw if isinstance(raw, list) else raw.get('events', [])
+                    match = next((e for e in items if isinstance(e, dict)
+                                  and e.get('uuid') == event_id), None)
+                    if match:
+                        self._send_json(200, {
+                            'event': match,
+                            'source': 'partner_api_live',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    else:
+                        self._send_error(404, f'Event not found: {event_id}')
+                    return
                 event = MOCK_EVENTS.get(event_id)
                 if event:
                     self._send_json(200, {
@@ -205,6 +292,13 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             # GET /events/{id}/stats - Get scan statistics
             if path.startswith('/events/') and path.endswith('/stats'):
                 event_id = path.split('/')[-2]
+                if LIVE_MODE:
+                    self._send_json(200, {
+                        'message': 'Scan statistics are not available via the NxtGn Partner API in this POC (only event data is live).',
+                        'source': 'partner_api_live',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    return
                 if event_id not in MOCK_EVENTS:
                     self._send_error(404, f'Event not found: {event_id}')
                     return
@@ -245,6 +339,15 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         try:
             # POST /entrance-plans - Create entrance plan
             if path == '/entrance-plans':
+                if LIVE_MODE:
+                    self._send_json(200, {
+                        'success': False,
+                        'message': 'Creating entrance plans is not available via the NxtGn Partner API in this POC (event data is read-only/live).',
+                        'source': 'partner_api_live',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    return
+
                 body = self._read_json()
 
                 if not isinstance(body, dict):
@@ -313,6 +416,10 @@ def run_server():
     print('='*60)
     print(f'Port: {PORT}')
     print(f'Authentication: Bearer {INTERNAL_KEY}')
+    if LIVE_MODE:
+        print(f'Data mode: LIVE  -> NxtGn Partner API ({PARTNER_BASE})')
+    else:
+        print('Data mode: MOCK  (set PARTNER_API_* env vars for live data)')
     print(f'\nEndpoints:')
     print(f'  GET  http://localhost:{PORT}/health')
     print(f'  GET  http://localhost:{PORT}/events')
