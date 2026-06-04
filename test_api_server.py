@@ -316,7 +316,8 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             try:
                 data = fetch_all_events()
             except Exception as e:
-                self._send_error(502, f'Partner API call failed: {e}')
+                self._send_json(200, {'status': 502, 'error': f'Partner API call failed: {e}',
+                                      'source': 'partner_api_live', 'timestamp': datetime.now().isoformat()})
                 return
 
             trimmed = [trim_event(e) for e in data]
@@ -339,12 +340,15 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             return
 
         # Everything else: forward the full path (incl. query) untouched.
+        # Always answer HALO with HTTP 200 and put the REAL upstream status in the
+        # body, so the agent can see error details instead of HALO hard-failing on 4xx.
         try:
             status, data = partner_request('GET', self.path)
         except Exception as e:
-            self._send_error(502, f'Partner API call failed: {e}')
+            self._send_json(200, {'status': 502, 'error': f'Partner API call failed: {e}',
+                                  'source': 'partner_api_live', 'timestamp': datetime.now().isoformat()})
             return
-        self._send_json(status, {
+        self._send_json(200, {
             'status': status,
             'data': data,
             'source': 'partner_api_live',
@@ -361,9 +365,12 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         try:
             status, data = partner_request('POST', self.path, body)
         except Exception as e:
-            self._send_error(502, f'Partner API call failed: {e}')
+            self._send_json(200, {'status': 502, 'error': f'Partner API call failed: {e}',
+                                  'source': 'partner_api_live', 'timestamp': datetime.now().isoformat()})
             return
-        self._send_json(status, {
+        # Always 200 to HALO with the real upstream status in the body (so the agent
+        # sees error details instead of HALO hard-failing on a 4xx).
+        self._send_json(200, {
             'status': status,
             'data': data,
             'source': 'partner_api_live',
