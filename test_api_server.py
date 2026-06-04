@@ -269,9 +269,12 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
             decoded = raw.decode('utf-8')
             parsed = json.loads(decoded)
-            # HALO http_activity may double-encode a string body.
+            # HALO http_activity may double-encode a string body. An empty body
+            # arrives as a JSON-encoded empty string ("") — treat that as no body
+            # instead of trying (and failing) to json.loads("").
             if isinstance(parsed, str):
-                parsed = json.loads(parsed)
+                stripped = parsed.strip()
+                parsed = json.loads(stripped) if stripped else {}
             return parsed
         except json.JSONDecodeError as e:
             raise ValueError(f'Invalid JSON payload: {e}')
@@ -360,10 +363,12 @@ class TestAPIHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json()
         except ValueError as e:
-            self._send_error(400, str(e))
+            self._send_json(200, {'status': 400, 'error': str(e),
+                                  'source': 'partner_api_live', 'timestamp': datetime.now().isoformat()})
             return
         try:
-            status, data = partner_request('POST', self.path, body)
+            # Empty body ({}) -> send no JSON body (matches a plain complete call).
+            status, data = partner_request('POST', self.path, body or None)
         except Exception as e:
             self._send_json(200, {'status': 502, 'error': f'Partner API call failed: {e}',
                                   'source': 'partner_api_live', 'timestamp': datetime.now().isoformat()})
